@@ -1,0 +1,177 @@
+// Define the region of interest (Kebili, Tunisia)
+var kebili = ee.Geometry.Polygon([
+  [[8.8488, 33.9434], [9.2437, 33.9434], [9.2437, 33.4133], [8.8488, 33.4133]]
+]);
+
+// Load Sentinel-2 imagery
+var sentinel2 = ee.ImageCollection('COPERNICUS/S2')
+                  .filterBounds(kebili)
+                  .filterDate('2024-01-01', '2024-12-31')
+                  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10));
+
+// Calculate NDVI
+var ndviComposite = sentinel2.map(function(image) {
+  return image.addBands(image.normalizedDifference(['B8', 'B4']).rename('NDVI'));
+}).select('NDVI').median();
+
+// Calculate NDWI
+var ndwiComposite = sentinel2.map(function(image) {
+  return image.addBands(image.normalizedDifference(['B3', 'B8']).rename('NDWI'));
+}).select('NDWI').median();
+
+// Calculate PIR (Photochemical Reflectance Index)
+var pirComposite = sentinel2.map(function(image) {
+  return image.addBands(image.normalizedDifference(['B2', 'B4']).rename('PIR'));
+}).select('PIR').median();
+
+// Calculate NDSI (Normalized Difference Salinity Index)
+var ndsiComposite = sentinel2.map(function(image) {
+  return image.normalizedDifference(['B3', 'B5']).rename('NDSI'); // B3 (Green) and B5 (Red-Edge)
+}).median();
+
+// Simulated IoT data with labels (healthy or stressed)
+var iotData = ee.FeatureCollection([
+  ee.Feature(ee.Geometry.Point([8.9, 33.8]), {soilMoisture: 20, temperature: 28, health: 'healthy'}),
+  ee.Feature(ee.Geometry.Point([9.0, 33.7]), {soilMoisture: 12, temperature: 32, health: 'stressed'}),
+  ee.Feature(ee.Geometry.Point([8.95, 33.75]), {soilMoisture: 10, temperature: 30, health: 'stressed'})
+]);
+
+// Prepare training data by sampling NDVI, NDWI, NDSI, PIR at IoT locations
+var trainingData = iotData.map(function(feature) {
+  var ndvi = ndviComposite.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: feature.geometry(),
+    scale: 30
+  }).get('NDVI');
+  
+  var ndwi = ndwiComposite.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: feature.geometry(),
+    scale: 30
+  }).get('NDWI');
+  
+  var pir = pirComposite.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: feature.geometry(),
+    scale: 30
+  }).get('PIR');
+  
+  var ndsi = ndsiComposite.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: feature.geometry(),
+    scale: 30
+  }).get('NDSI');
+  
+  return feature.set({NDVI: ndvi, NDWI: ndwi, PIR: pir, NDSI: ndsi});
+});
+
+// Prepare the dataset for Random Forest training
+var classifierTrainingData = trainingData.map(function(feature) {
+  return ee.Feature(null, feature.toDictionary(['NDVI', 'NDWI', 'PIR', 'NDSI', 'soilMoisture', 'temperature', 'health']));
+});
+
+// Train a Random Forest classifier
+var classifier = ee.Classifier.smileRandomForest(10).train({
+  features: classifierTrainingData,
+  classProperty: 'health',
+  inputProperties: ['NDVI', 'NDWI', 'PIR', 'NDSI', 'soilMoisture', 'temperature']
+});
+
+// Classify the entire region
+var classified = ndviComposite.addBands(ndwiComposite).addBands(pirComposite).addBands(ndsiComposite).classify(classifier);
+
+// Visualization settings for classification
+var classificationVis = {
+  min: 0,
+  max: 1,
+  palette: ['green', 'red'], // Green for healthy, red for stressed
+  opacity: 0.6
+};
+
+// Add layers to the map
+Map.centerObject(kebili, 10); // Center the map on the region
+Map.addLayer(ndviComposite, {min: 0, max: 1, palette: ['red', 'yellow', 'green']}, 'NDVI Composite');
+Map.addLayer(ndwiComposite, {min: -1, max:0.5, palette: ['brown', 'white', 'blue']}, 'NDWI Composite');
+Map.addLayer(pirComposite, {min: -0.5, max: 0.5, palette: ['red', 'yellow', 'green']}, 'PIR Composite');
+Map.addLayer(ndsiComposite, {min: -0.5, max: 0.3, palette: ['blue', 'yellow', 'red']}, 'NDSI Composite (Salinity)');
+Map.addLayer(classified, classificationVis, 'Crop Health Classification');
+
+// Generate Alerts and Recommendations based on classification
+var alertsAndRecommendations = ee.FeatureCollection([]);
+
+// Analyze salinization and generate recommendations
+classified.reduceToVectors({
+  geometryType: 'polygon',
+  reducer: ee.Reducer.countEvery(),
+  scale: 30,
+  maxPixels: 1e9
+}).evaluate(function(result) {
+  if (result && result.features) {
+    var features = result.features;
+    features.forEach(function(feature) {
+      var geometry = ee.Geometry(feature.geometry);
+      var isStressed = feature.properties.count > 0; // Simplified alert logic
+      var alertMessage = isStressed
+        ? 'Stress detected in this area. Immediate attention required.'
+        : 'Area is healthy. No immediate action needed.';
+      var recommendation = isStressed
+        ? 'Consider irrigation and soil treatment to reduce salinization.'
+        : 'Maintain current practices.';
+
+      // Print alert and recommendation
+      print(alertMessage + ' Recommendation: ' + recommendation);
+
+      // Add a marker for each alert
+      var point = geometry.centroid();
+      Map.addLayer(point, {color: isStressed ? 'red' : 'green'}, alertMessage);
+    });
+  } else {
+    print('No stressed areas detected or the result is undefined.');
+  }
+});
+
+// Add legend for NDVI, NDWI, PIR, NDSI, and stress areas
+function addLegend(title, palette, range) {
+  var legend = ui.Panel({
+    style: {
+      position: 'bottom-left',
+      padding: '8px 15px'
+    }
+  });
+  var legendTitle = ui.Label({
+    value: title,
+    style: {
+      fontWeight: 'bold',
+      fontSize: '16px',
+      margin: '0 0 4px 0',
+      padding: '0'
+    }
+  });
+  legend.add(legendTitle);
+  palette.forEach(function(color, index) {
+    var colorBox = ui.Label({
+      style: {
+        backgroundColor: color,
+        padding: '8px',
+        margin: '0 0 4px 0'
+      }
+    });
+    var description = ui.Label({
+      value: range[index],
+      style: {margin: '0 0 4px 6px'}
+    });
+    var row = ui.Panel({
+      widgets: [colorBox, description],
+      layout: ui.Panel.Layout.Flow('horizontal')
+    });
+    legend.add(row);
+  });
+  Map.add(legend);
+}
+
+// Add legends for NDVI, NDWI, PIR, NDSI, and stress areas
+addLegend('NDVI', ['red', 'yellow', 'green'], ['Low', 'Moderate', 'High']);
+addLegend('NDWI', ['brown', 'white', 'blue'], ['Dry', 'Moist', 'Water']);
+addLegend('PIR', ['red', 'yellow', 'green'], ['Low', 'Moderate', 'High']);
+addLegend('Salinization (NDSI)', ['blue', 'yellow', 'red'], ['Low', 'Moderate', 'High']);
+addLegend('Stress', ['purple'], ['Stressed']);
